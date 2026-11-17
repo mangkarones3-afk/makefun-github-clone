@@ -4,7 +4,7 @@
 // route answers JSON; errors carry a string `message`; unknown routes are a JSON 404.
 
 import type { IncomingMessage, ServerResponse } from 'node:http';
-import { isRecord, parseJsonBody, sendEmpty, sendJson } from './http.ts';
+import { isRecord, parseJsonBody, sendEmpty, sendJson, sendJsonBuffer } from './http.ts';
 import {
   VIEWER,
   branchTip,
@@ -51,6 +51,52 @@ function issueJson(repo: RepoState, issue: IssueState): Record<string, unknown> 
   };
   if (issue.isPull) body.pull_request = { url: `/api/v3/repos/${repo.owner}/${repo.name}/pulls/${issue.number}` };
   return body;
+}
+
+/**
+ * Serialized issueJson bodies, per issue. The stamp covers every field issueJson reads:
+ * title, body and state (reassigned by PATCH), the labels array (replaced wholesale by
+ * PATCH, never mutated in place), the comment count (comments are append-only), and the
+ * repo name (a rename rewrites a pull's url). Label colors cannot change under a live
+ * stamp: labels are created once and never updated or deleted. Any mutation moves a
+ * stamped field, so a stale body can never be served.
+ */
+interface IssueJsonCacheEntry {
+  readonly title: string;
+  readonly body: string;
+  readonly state: string;
+  readonly labels: readonly string[];
+  readonly comments: number;
+  readonly repoName: string;
+  readonly buffer: Buffer;
+}
+
+const issueJsonCache = new WeakMap<IssueState, IssueJsonCacheEntry>();
+
+function issueJsonBuffer(repo: RepoState, issue: IssueState): Buffer {
+  const cached = issueJsonCache.get(issue);
+  if (
+    cached &&
+    cached.title === issue.title &&
+    cached.body === issue.body &&
+    cached.state === issue.state &&
+    cached.labels === issue.labels &&
+    cached.comments === issue.comments.length &&
+    cached.repoName === repo.name
+  ) {
+    return cached.buffer;
+  }
+  const buffer = Buffer.from(JSON.stringify(issueJson(repo, issue)), 'utf8');
+  issueJsonCache.set(issue, {
+    title: issue.title,
+    body: issue.body,
+    state: issue.state,
+    labels: issue.labels,
+    comments: issue.comments.length,
+    repoName: repo.name,
+    buffer,
+  });
+  return buffer;
 }
 
 function pullJson(repo: RepoState, pull: IssueState): Record<string, unknown> {
@@ -653,7 +699,7 @@ async function handleIssues(
       return;
     }
     if (method === 'GET') {
-      sendJson(res, 200, issueJson(repo, issue));
+      sendJsonBuffer(res, 200, issueJsonBuffer(repo, issue));
       return;
     }
     if (method === 'PATCH') {

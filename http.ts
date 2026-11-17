@@ -30,6 +30,22 @@ export function sendJson(
   res.end(text);
 }
 
+/** sendJson for a body the caller already serialized: identical headers and bytes. */
+export function sendJsonBuffer(
+  res: ServerResponse,
+  status: number,
+  body: Buffer,
+  headers: Readonly<Record<string, string>> = {},
+): void {
+  res.writeHead(status, {
+    'content-type': JSON_TYPE,
+    'content-length': body.length,
+    'x-github-request-id': nextRequestId(),
+    ...headers,
+  });
+  res.end(body);
+}
+
 export function sendEmpty(res: ServerResponse, status: number): void {
   res.writeHead(status, { 'x-github-request-id': nextRequestId() });
   res.end();

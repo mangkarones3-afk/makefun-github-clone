@@ -444,8 +444,28 @@ function writePackObjectHeader(type: GitObjectType, size: number): Buffer {
   return Buffer.from(bytes);
 }
 
+/**
+ * Deflated object bodies by object id. Objects are immutable and content-addressed, so a
+ * deflated body stays valid forever; the cache is bounded and evicts oldest-first.
+ */
+const deflateCache = new Map<string, Buffer>();
+const DEFLATE_CACHE_MAX = 100_000;
+
+function deflateObject(oid: string | undefined, type: GitObjectType, data: Buffer): Buffer {
+  const key = oid ?? hashObject(type, data);
+  const cached = deflateCache.get(key);
+  if (cached) return cached;
+  const deflated = deflateSync(data);
+  if (deflateCache.size >= DEFLATE_CACHE_MAX) {
+    const oldest = deflateCache.keys().next().value;
+    if (oldest !== undefined) deflateCache.delete(oldest);
+  }
+  deflateCache.set(key, deflated);
+  return deflated;
+}
+
 /** Build a packfile of plain (non-delta) objects, in the order given. */
-export function writePack(objects: ReadonlyArray<{ type: GitObjectType; data: Buffer }>): Buffer {
+export function writePack(objects: ReadonlyArray<{ oid?: string; type: GitObjectType; data: Buffer }>): Buffer {
   const parts: Buffer[] = [];
   const header = Buffer.allocUnsafe(12);
   header.write('PACK', 0, 4, 'ascii');
@@ -454,7 +474,7 @@ export function writePack(objects: ReadonlyArray<{ type: GitObjectType; data: Bu
   parts.push(header);
   for (const object of objects) {
     parts.push(writePackObjectHeader(object.type, object.data.length));
-    parts.push(deflateSync(object.data));
+    parts.push(deflateObject(object.oid, object.type, object.data));
   }
   const body = Buffer.concat(parts);
   return Buffer.concat([body, createHash('sha1').update(body).digest()]);

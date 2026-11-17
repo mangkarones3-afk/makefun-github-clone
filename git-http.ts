@@ -96,6 +96,18 @@ function v2Advertisement(service: string): Buffer {
   return Buffer.concat(parts);
 }
 
+/** The v2 capability advertisement depends only on the service name: build it once. */
+const v2AdvertisementCache = new Map<string, Buffer>();
+
+function v2AdvertisementCached(service: string): Buffer {
+  let body = v2AdvertisementCache.get(service);
+  if (!body) {
+    body = v2Advertisement(service);
+    v2AdvertisementCache.set(service, body);
+  }
+  return body;
+}
+
 export function handleInfoRefs(req: IncomingMessage, res: ServerResponse, url: URL, owner: string, repoName: string): void {
   const service = url.searchParams.get('service') ?? '';
   if (service !== 'git-upload-pack' && service !== 'git-receive-pack') {
@@ -108,7 +120,7 @@ export function handleInfoRefs(req: IncomingMessage, res: ServerResponse, url: U
     return;
   }
   const wantsV2 = service === 'git-upload-pack' && (req.headers['git-protocol'] ?? '').includes('version=2');
-  const body = wantsV2 ? v2Advertisement(service) : v0Advertisement(repo, service);
+  const body = wantsV2 ? v2AdvertisementCached(service) : v0Advertisement(repo, service);
   sendBuffer(res, 200, body, `application/x-${service}-advertisement`, { 'cache-control': 'no-cache' });
 }
 
@@ -153,9 +165,51 @@ interface FetchArgs {
   done: boolean;
 }
 
-function buildFetchPack(repo: RepoState, args: FetchArgs): { pack: Buffer; shallow: string[]; unshallow: string[] } {
+interface FetchPackResult {
+  pack: Buffer;
+  shallow: string[];
+  unshallow: string[];
+}
+
+/**
+ * Built packs by fetch signature, per repository. A fetch result is a pure function of
+ * the object store's contents and the request's wants/haves/shallow/depth; the store is
+ * append-only (objects are never removed or replaced), so its size pins its contents and
+ * serves as the version in the key. Any mutation adds objects and so changes the key —
+ * a stale pack can never be served. The build is synchronous, so concurrent identical
+ * fetches cannot interleave: the first builds, the rest hit the cache. Bounded,
+ * oldest-first eviction.
+ */
+const packCacheByRepo = new WeakMap<RepoState, Map<string, FetchPackResult>>();
+const PACK_CACHE_MAX = 16;
+
+function buildFetchPack(repo: RepoState, args: FetchArgs): FetchPackResult {
+  const key = [
+    repo.objects.size,
+    args.depth ?? '',
+    args.wants.join(' '),
+    args.haves.join(' '),
+    args.shallow.join(' '),
+  ].join('|');
+  let cache = packCacheByRepo.get(repo);
+  if (!cache) {
+    cache = new Map();
+    packCacheByRepo.set(repo, cache);
+  }
+  const hit = cache.get(key);
+  if (hit) return hit;
+  const built = buildFetchPackUncached(repo, args);
+  if (cache.size >= PACK_CACHE_MAX) {
+    const oldest = cache.keys().next().value;
+    if (oldest !== undefined) cache.delete(oldest);
+  }
+  cache.set(key, built);
+  return built;
+}
+
+function buildFetchPackUncached(repo: RepoState, args: FetchArgs): FetchPackResult {
   const selection = selectFetchObjects(repo.objects, args.wants, args.haves, args.shallow, args.depth);
-  const objects: Array<{ type: GitObject['type']; data: Buffer }> = [];
+  const objects: Array<{ oid: string; type: GitObject['type']; data: Buffer }> = [];
   // Commits first, then trees, then blobs, then tags: a stable, readable pack order.
   const rank = { commit: 0, tree: 1, blob: 2, tag: 3 } as const;
   const sorted = [...selection.objects].sort((a, b) => {
@@ -165,7 +219,7 @@ function buildFetchPack(repo: RepoState, args: FetchArgs): { pack: Buffer; shall
   });
   for (const oid of sorted) {
     const object = repo.objects.get(oid);
-    if (object) objects.push(object);
+    if (object) objects.push({ oid, type: object.type, data: object.data });
   }
   return { pack: writePack(objects), shallow: selection.shallow, unshallow: selection.unshallow };
 }
