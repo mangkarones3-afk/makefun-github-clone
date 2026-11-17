@@ -9,6 +9,7 @@ import {
   ZERO_OID,
   decodePktStream,
   encodePktLine,
+  encodeSidebandPacket,
   isAncestor,
   isObjectId,
   parseTag,
@@ -108,8 +109,8 @@ function v2AdvertisementCached(service: string): Buffer {
   return body;
 }
 
-export function handleInfoRefs(req: IncomingMessage, res: ServerResponse, url: URL, owner: string, repoName: string): void {
-  const service = url.searchParams.get('service') ?? '';
+export function handleInfoRefs(req: IncomingMessage, res: ServerResponse, rawQuery: string, owner: string, repoName: string): void {
+  const service = new URLSearchParams(rawQuery).get('service') ?? '';
   if (service !== 'git-upload-pack' && service !== 'git-receive-pack') {
     sendJson(res, 403, { message: 'Forbidden' });
     return;
@@ -207,6 +208,42 @@ function buildFetchPack(repo: RepoState, args: FetchArgs): FetchPackResult {
   return built;
 }
 
+/**
+ * Whole fetch responses under the same signature discipline as the pack cache: the
+ * framed response (acknowledgments, shallow-info, sideband packets) reads only the
+ * object store and the fetch arguments — never the refs — so it is a pure function
+ * of the same key. The clone workload issues fifty identical fetches at once; after
+ * the first, each is a map hit and one buffer send.
+ */
+const fetchResponseCacheByRepo = new WeakMap<RepoState, Map<string, Buffer>>();
+const FETCH_RESPONSE_CACHE_MAX = 16;
+
+function fetchResponseCached(repo: RepoState, version: 'v2' | 'v0', args: FetchArgs): Buffer {
+  const key = [
+    repo.objects.size,
+    version,
+    args.done ? 'done' : 'pending',
+    args.depth ?? '',
+    args.wants.join(' '),
+    args.haves.join(' '),
+    args.shallow.join(' '),
+  ].join('|');
+  let cache = fetchResponseCacheByRepo.get(repo);
+  if (!cache) {
+    cache = new Map();
+    fetchResponseCacheByRepo.set(repo, cache);
+  }
+  const hit = cache.get(key);
+  if (hit) return hit;
+  const built = version === 'v2' ? fetchResponseV2(repo, args) : fetchResponseV0(repo, args);
+  if (cache.size >= FETCH_RESPONSE_CACHE_MAX) {
+    const oldest = cache.keys().next().value;
+    if (oldest !== undefined) cache.delete(oldest);
+  }
+  cache.set(key, built);
+  return built;
+}
+
 function buildFetchPackUncached(repo: RepoState, args: FetchArgs): FetchPackResult {
   const selection = selectFetchObjects(repo.objects, args.wants, args.haves, args.shallow, args.depth);
   const objects: Array<{ oid: string; type: GitObject['type']; data: Buffer }> = [];
@@ -230,12 +267,13 @@ function sidebandPackets(pack: Buffer): Buffer[] {
   const CHUNK = 65515;
   for (let offset = 0; offset < pack.length; offset += CHUNK) {
     const chunk = pack.subarray(offset, Math.min(pack.length, offset + CHUNK));
-    const payload = Buffer.concat([Buffer.from([1]), chunk]);
-    packets.push(encodePktLine(payload));
+    packets.push(encodeSidebandPacket(1, chunk));
   }
-  if (pack.length === 0) packets.push(encodePktLine(Buffer.from([1])));
+  if (pack.length === 0) packets.push(encodeSidebandPacket(1, EMPTY_BUFFER));
   return packets;
 }
+
+const EMPTY_BUFFER = Buffer.alloc(0);
 
 function fetchResponseV2(repo: RepoState, args: FetchArgs): Buffer {
   const parts: Buffer[] = [];
@@ -320,7 +358,7 @@ export function handleUploadPack(req: IncomingMessage, res: ServerResponse, owne
         else if (line.startsWith('deepen ')) args.depth = Number.parseInt(line.slice(7), 10);
         else if (line === 'done') args.done = true;
       }
-      sendBuffer(res, 200, fetchResponseV2(repo, args), 'application/x-git-upload-pack-result');
+      sendBuffer(res, 200, fetchResponseCached(repo, 'v2', args), 'application/x-git-upload-pack-result');
       return;
     }
     sendBuffer(res, 400, Buffer.from('error: unknown command\n'), 'text/plain');
@@ -346,7 +384,7 @@ export function handleUploadPack(req: IncomingMessage, res: ServerResponse, owne
       }
     }
   });
-  sendBuffer(res, 200, fetchResponseV0(repo, args), 'application/x-git-upload-pack-result');
+  sendBuffer(res, 200, fetchResponseCached(repo, 'v0', args), 'application/x-git-upload-pack-result');
 }
 
 // ------------------------------------------------------------------ receive-pack
@@ -423,7 +461,7 @@ export function handleReceivePack(_req: IncomingMessage, res: ServerResponse, ow
     const CHUNK = 65515;
     for (let offset = 0; offset < report.length; offset += CHUNK) {
       const chunk = report.subarray(offset, Math.min(report.length, offset + CHUNK));
-      packets.push(encodePktLine(Buffer.concat([Buffer.from([1]), chunk])));
+      packets.push(encodeSidebandPacket(1, chunk));
     }
     packets.push(pktFlush());
     sendBuffer(res, 200, Buffer.concat(packets), 'application/x-git-receive-pack-result');

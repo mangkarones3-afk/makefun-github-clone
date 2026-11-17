@@ -151,8 +151,15 @@ function paginate<T>(
 
 interface Route {
   readonly segments: string[];
-  readonly query: URLSearchParams;
+  readonly rawQuery: string;
+  queryCache: URLSearchParams | null;
   readonly host: string;
+}
+
+/** The route's query parameters, parsed on first use (most routes never read them). */
+function routeQuery(route: Route): URLSearchParams {
+  if (route.queryCache === null) route.queryCache = new URLSearchParams(route.rawQuery);
+  return route.queryCache;
 }
 
 /** Percent-decode one path segment (never throws). */
@@ -164,42 +171,51 @@ function decodeSegment(segment: string): string {
   }
 }
 
-export async function handleRest(req: IncomingMessage, res: ServerResponse, url: URL, body: Buffer): Promise<void> {
+export async function handleRest(req: IncomingMessage, res: ServerResponse, path: string, rawQuery: string, body: Buffer): Promise<void> {
   const method = req.method ?? 'GET';
-  const path = url.pathname;
-  const segments = path.split('/').filter((s) => s !== '').map(decodeSegment);
-  const route: Route = { segments, query: url.searchParams, host: req.headers.host ?? 'localhost' };
-  const base = `http://${route.host}${path}`;
+  const host = req.headers.host ?? 'localhost';
 
-  // Root and meta.
-  if (segments.length === 2 && segments[0] === 'api' && segments[1] === 'v3') {
-    if (method === 'GET') {
-      sendJson(
-        res,
-        200,
-        {
-          current_user_url: '/api/v3/user',
-          repository_url: '/api/v3/repos/{owner}/{repo}',
-          rate_limit_url: '/api/v3/rate_limit',
-        },
-        { 'x-oauth-scopes': 'repo, read:org' },
-      );
+  const sendRoot = (): void => {
+    sendJson(
+      res,
+      200,
+      {
+        current_user_url: '/api/v3/user',
+        repository_url: '/api/v3/repos/{owner}/{repo}',
+        rate_limit_url: '/api/v3/rate_limit',
+      },
+      { 'x-oauth-scopes': 'repo, read:org' },
+    );
+  };
+
+  // Root and meta: the clean forms are plain string compares; the segment check
+  // below still catches slash-collapsed spellings of the root, as before.
+  if (method === 'GET') {
+    if (path === '/api/v3' || path === '/api/v3/') {
+      sendRoot();
+      return;
+    }
+    if (path === '/api/v3/meta') {
+      sendJson(res, 200, { installed_version: '1.0.0-forge', verifiable_password_authentication: false });
+      return;
+    }
+    if (path === '/api/v3/user') {
+      sendJson(res, 200, { login: VIEWER.login, id: VIEWER.id, name: VIEWER.name, email: VIEWER.email, type: 'User' });
       return;
     }
   }
-  if (path === '/api/v3/meta' && method === 'GET') {
-    sendJson(res, 200, { installed_version: '1.0.0-forge', verifiable_password_authentication: false });
+  const segments = path.split('/').filter((s) => s !== '').map(decodeSegment);
+  if (segments.length === 2 && segments[0] === 'api' && segments[1] === 'v3' && method === 'GET') {
+    sendRoot();
     return;
   }
-  if (path === '/api/v3/user' && method === 'GET') {
-    sendJson(res, 200, { login: VIEWER.login, id: VIEWER.id, name: VIEWER.name, email: VIEWER.email, type: 'User' });
-    return;
-  }
+  const route: Route = { segments, rawQuery, queryCache: null, host };
+  const base = `http://${host}${path}`;
 
   // The viewer's repositories.
   if (path === '/api/v3/user/repos') {
     if (method === 'GET') {
-      paginate(res, 200, forge.viewerRepos().map(repoJson), route.query, base);
+      paginate(res, 200, forge.viewerRepos().map(repoJson), routeQuery(route), base);
       return;
     }
     if (method === 'POST') {
@@ -314,7 +330,7 @@ async function handleRepoRoute(
   // Commits.
   if (rest[0] === 'commits') {
     if (method === 'GET' && rest.length === 1) {
-      const shaParam = route.query.get('sha');
+      const shaParam = routeQuery(route).get('sha');
       const startRef = shaParam && shaParam !== '' ? shaParam : repo.defaultBranch;
       const tip = resolveCommit(repo, startRef);
       if (!tip) {
@@ -338,7 +354,7 @@ async function handleRepoRoute(
         const commit = parseCommit(repo.objects.get(oid)!.data)!;
         return { sha: oid, commit: { message: commit.message.replace(/\n$/, ''), tree: { sha: commit.tree } } };
       });
-      paginate(res, 200, list, route.query, base);
+      paginate(res, 200, list, routeQuery(route), base);
       return;
     }
     if (method === 'GET' && rest.length === 2) {
@@ -459,7 +475,7 @@ async function handleContents(
   const path = rawPath.replace(/^\/+|\/+$/g, '');
 
   if (method === 'GET') {
-    const refParam = route.query.get('ref');
+    const refParam = routeQuery(route).get('ref');
     const commit = resolveCommit(repo, refParam && refParam !== '' ? refParam : repo.defaultBranch);
     if (!commit) {
       sendJson(res, 404, NOT_FOUND);
@@ -635,6 +651,67 @@ export function createIssueRecord(
   return issue;
 }
 
+/**
+ * The issue-create response, shared by the general router and app.ts's fast path.
+ * Validation order and messages are the router's; the reply goes out as the cached
+ * serialized buffer (byte-identical to stringifying issueJson, and it warms the
+ * cache for the read that usually follows a create).
+ */
+function createIssueResponse(res: ServerResponse, repo: RepoState, body: Buffer): void {
+  const parsed = parseJsonBody(body);
+  if (!parsed.ok || !isRecord(parsed.value)) {
+    sendJson(res, 400, { message: 'Problems parsing JSON' });
+    return;
+  }
+  const title = parsed.value.title;
+  if (typeof title !== 'string' || title === '') {
+    sendJson(res, 422, { message: 'Title is required' });
+    return;
+  }
+  const labelNames: string[] = [];
+  if (Array.isArray(parsed.value.labels)) {
+    for (const label of parsed.value.labels) {
+      const name = typeof label === 'string' ? label : isRecord(label) && typeof label.name === 'string' ? label.name : '';
+      if (name === '' || !repo.labels.has(name)) {
+        sendJson(res, 422, { message: `Label '${name}' does not exist in this repository` });
+        return;
+      }
+      labelNames.push(name);
+    }
+  }
+  const issue = createIssueRecord(repo, {
+    title,
+    body: typeof parsed.value.body === 'string' ? parsed.value.body : '',
+    labels: labelNames,
+  });
+  sendJsonBuffer(res, 201, issueJsonBuffer(repo, issue));
+}
+
+/** Fast path (app.ts): GET /api/v3/repos/{owner}/{repo}/issues/{number}. */
+export function serveIssueGet(res: ServerResponse, owner: string, repoName: string, number: number): void {
+  const repo = forge.getRepo(owner, repoName);
+  if (!repo) {
+    sendJson(res, 404, NOT_FOUND);
+    return;
+  }
+  const issue = repo.issues.get(number);
+  if (!issue) {
+    sendJson(res, 404, NOT_FOUND);
+    return;
+  }
+  sendJsonBuffer(res, 200, issueJsonBuffer(repo, issue));
+}
+
+/** Fast path (app.ts): POST /api/v3/repos/{owner}/{repo}/issues. */
+export function serveIssueCreate(res: ServerResponse, owner: string, repoName: string, body: Buffer): void {
+  const repo = forge.getRepo(owner, repoName);
+  if (!repo) {
+    sendJson(res, 404, NOT_FOUND);
+    return;
+  }
+  createIssueResponse(res, repo, body);
+}
+
 async function handleIssues(
   req: IncomingMessage,
   res: ServerResponse,
@@ -648,42 +725,16 @@ async function handleIssues(
 
   if (rest.length === 0) {
     if (method === 'POST') {
-      const parsed = parseJsonBody(body);
-      if (!parsed.ok || !isRecord(parsed.value)) {
-        sendJson(res, 400, { message: 'Problems parsing JSON' });
-        return;
-      }
-      const title = parsed.value.title;
-      if (typeof title !== 'string' || title === '') {
-        sendJson(res, 422, { message: 'Title is required' });
-        return;
-      }
-      const labelNames: string[] = [];
-      if (Array.isArray(parsed.value.labels)) {
-        for (const label of parsed.value.labels) {
-          const name = typeof label === 'string' ? label : isRecord(label) && typeof label.name === 'string' ? label.name : '';
-          if (name === '' || !repo.labels.has(name)) {
-            sendJson(res, 422, { message: `Label '${name}' does not exist in this repository` });
-            return;
-          }
-          labelNames.push(name);
-        }
-      }
-      const issue = createIssueRecord(repo, {
-        title,
-        body: typeof parsed.value.body === 'string' ? parsed.value.body : '',
-        labels: labelNames,
-      });
-      sendJson(res, 201, issueJson(repo, issue));
+      createIssueResponse(res, repo, body);
       return;
     }
     if (method === 'GET') {
-      const state = route.query.get('state') ?? 'open';
+      const state = routeQuery(route).get('state') ?? 'open';
       let list = [...repo.issues.values()].filter((issue) => !issue.isPull);
       if (state === 'open' || state === 'closed') list = list.filter((issue) => issue.state === state);
-      const direction = route.query.get('direction') ?? 'desc';
+      const direction = routeQuery(route).get('direction') ?? 'desc';
       list.sort((a, b) => (direction === 'asc' ? a.number - b.number : b.number - a.number));
-      paginate(res, 200, list.map((issue) => issueJson(repo, issue)), route.query, base);
+      paginate(res, 200, list.map((issue) => issueJson(repo, issue)), routeQuery(route), base);
       return;
     }
     sendJson(res, 404, NOT_FOUND);
@@ -841,12 +892,12 @@ async function handlePulls(
       return;
     }
     if (method === 'GET') {
-      const state = route.query.get('state') ?? 'open';
+      const state = routeQuery(route).get('state') ?? 'open';
       let list = [...repo.issues.values()].filter((issue) => issue.isPull);
       if (state === 'open') list = list.filter((issue) => issue.state === 'open');
       else if (state === 'closed') list = list.filter((issue) => issue.state === 'closed');
       list.sort((a, b) => b.number - a.number);
-      paginate(res, 200, list.map((pull) => pullJson(repo, pull)), route.query, base);
+      paginate(res, 200, list.map((pull) => pullJson(repo, pull)), routeQuery(route), base);
       return;
     }
     sendJson(res, 404, NOT_FOUND);

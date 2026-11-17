@@ -20,14 +20,16 @@ export function sendJson(
   body: unknown,
   headers: Readonly<Record<string, string>> = {},
 ): void {
-  const text = JSON.stringify(body);
+  // Encode once: the buffer's length is the content-length, and ending with the
+  // buffer spares the extra byteLength scan and re-encode a string end would pay.
+  const buffer = Buffer.from(JSON.stringify(body), 'utf8');
   res.writeHead(status, {
     'content-type': JSON_TYPE,
-    'content-length': Buffer.byteLength(text),
+    'content-length': buffer.length,
     'x-github-request-id': nextRequestId(),
     ...headers,
   });
-  res.end(text);
+  res.end(buffer);
 }
 
 /** sendJson for a body the caller already serialized: identical headers and bytes. */
@@ -77,19 +79,36 @@ export async function readBody(req: IncomingMessage): Promise<Buffer> {
     if (size > 512 * 1024 * 1024) throw new Error('request body too large');
     chunks.push(buffer);
   }
+  // Most bodies arrive as one chunk; concatenating a single chunk only copies it.
+  if (chunks.length === 1) return chunks[0];
   return Buffer.concat(chunks);
 }
 
-/** The expected bearer token, from the entry's environment ('' when unset: accept any). */
+let tokenCache: string | null = null;
+
+/**
+ * The expected bearer token, from the entry's environment ('' when unset: accept
+ * any). The environment is fixed before the process serves, so the first read is
+ * cached — process.env access on every request was measurable pure overhead.
+ */
 export function expectedToken(): string {
-  return process.env.MAKEFUN_SHOP_TOKEN ?? '';
+  if (tokenCache === null) tokenCache = process.env.MAKEFUN_SHOP_TOKEN ?? '';
+  return tokenCache;
 }
+
+let cachedToken: string | null = null;
+let cachedAuthHeader = '';
 
 /** True when the request carries the shop token (or no token is configured). */
 export function authorized(req: IncomingMessage): boolean {
   const token = expectedToken();
   if (token === '') return true;
-  return req.headers.authorization === `Bearer ${token}`;
+  // The token is fixed for the process's life; build the comparison string once.
+  if (token !== cachedToken) {
+    cachedToken = token;
+    cachedAuthHeader = `Bearer ${token}`;
+  }
+  return req.headers.authorization === cachedAuthHeader;
 }
 
 /** Parse a JSON body; {ok:false} for malformed JSON (distinct from a JSON null). */

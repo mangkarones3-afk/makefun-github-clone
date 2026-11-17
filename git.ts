@@ -27,7 +27,7 @@ export function isObjectId(value: string): boolean {
 export function hashObject(type: GitObjectType, data: Uint8Array): string {
   const body = Buffer.isBuffer(data) ? data : Buffer.from(data.buffer, data.byteOffset, data.byteLength);
   const hash = createHash('sha1');
-  hash.update(Buffer.from(`${type} ${body.length}\0`, 'utf8'));
+  hash.update(`${type} ${body.length}\0`, 'utf8');
   hash.update(body);
   return hash.digest('hex');
 }
@@ -362,16 +362,47 @@ export function mergeBase(store: ObjectStore, a: string, b: string): string | nu
 
 export const PKT_LINE_MAX = 65520;
 
+const HEX_DIGITS = '0123456789abcdef';
+
+/** Write a pkt-line length header (4 lowercase hex chars) into `out` at `offset`. */
+function writePktHeader(out: Buffer, offset: number, totalLength: number): void {
+  out[offset] = HEX_DIGITS.charCodeAt((totalLength >> 12) & 0xf);
+  out[offset + 1] = HEX_DIGITS.charCodeAt((totalLength >> 8) & 0xf);
+  out[offset + 2] = HEX_DIGITS.charCodeAt((totalLength >> 4) & 0xf);
+  out[offset + 3] = HEX_DIGITS.charCodeAt(totalLength & 0xf);
+}
+
 export function encodePktLine(payload: string | Uint8Array): Buffer {
   const data = typeof payload === 'string' ? Buffer.from(payload, 'utf8') : Buffer.from(payload.buffer, payload.byteOffset, payload.byteLength);
   if (data.length > PKT_LINE_MAX - 4) throw new Error('pkt-line too long');
-  const header = Buffer.allocUnsafe(4);
-  header.write((data.length + 4).toString(16).padStart(4, '0'), 0, 4, 'ascii');
-  return Buffer.concat([header, data]);
+  // One allocation for header + payload (the old code allocated both, then copied).
+  const out = Buffer.allocUnsafe(4 + data.length);
+  writePktHeader(out, 0, data.length + 4);
+  out.set(data, 4);
+  return out;
 }
 
-export const pktFlush = (): Buffer => Buffer.from('0000', 'ascii');
-export const pktDelim = (): Buffer => Buffer.from('0001', 'ascii');
+/**
+ * Frame bytes as one side-band packet: the pkt-line header, a band byte, then the
+ * bytes themselves, in a single allocation. `band` is the side-band channel (1 is
+ * pack data / the wrapped report stream).
+ */
+export function encodeSidebandPacket(band: number, chunk: Uint8Array): Buffer {
+  if (chunk.length + 1 > PKT_LINE_MAX - 4) throw new Error('pkt-line too long');
+  const out = Buffer.allocUnsafe(4 + 1 + chunk.length);
+  writePktHeader(out, 0, chunk.length + 1 + 4);
+  out[4] = band;
+  out.set(chunk, 5);
+  return out;
+}
+
+// The flush and delim packets are constant bytes; share one instance of each.
+// Callers only ever concatenate or send them, never mutate them.
+const PKT_FLUSH = Buffer.from('0000', 'ascii');
+const PKT_DELIM = Buffer.from('0001', 'ascii');
+
+export const pktFlush = (): Buffer => PKT_FLUSH;
+export const pktDelim = (): Buffer => PKT_DELIM;
 
 export type PktPacket =
   | { readonly kind: 'data'; readonly payload: Buffer }
@@ -429,7 +460,8 @@ export function packetLines(packets: readonly PktPacket[]): string[] {
 const TYPE_CODE: Readonly<Record<GitObjectType, number>> = { commit: 1, tree: 2, blob: 3, tag: 4 };
 const CODE_TYPE: Readonly<Record<number, GitObjectType>> = { 1: 'commit', 2: 'tree', 3: 'blob', 4: 'tag' };
 
-function writePackObjectHeader(type: GitObjectType, size: number): Buffer {
+/** The pack object header (type + varint size) as raw bytes. */
+function packObjectHeaderBytes(type: GitObjectType, size: number): number[] {
   const code = TYPE_CODE[type];
   const bytes: number[] = [];
   let remaining = size;
@@ -441,7 +473,7 @@ function writePackObjectHeader(type: GitObjectType, size: number): Buffer {
     remaining = Math.floor(remaining / 128);
   }
   bytes.push(first);
-  return Buffer.from(bytes);
+  return bytes;
 }
 
 /**
@@ -466,18 +498,30 @@ function deflateObject(oid: string | undefined, type: GitObjectType, data: Buffe
 
 /** Build a packfile of plain (non-delta) objects, in the order given. */
 export function writePack(objects: ReadonlyArray<{ oid?: string; type: GitObjectType; data: Buffer }>): Buffer {
-  const parts: Buffer[] = [];
-  const header = Buffer.allocUnsafe(12);
-  header.write('PACK', 0, 4, 'ascii');
-  header.writeUInt32BE(2, 4);
-  header.writeUInt32BE(objects.length, 8);
-  parts.push(header);
+  // Deflate everything first (cached per object), then lay the whole pack —
+  // header, object headers, bodies and the trailer hash — into one allocation
+  // instead of a parts list and two concatenations.
+  const entries: Array<{ header: number[]; deflated: Buffer }> = [];
+  let bodyLength = 12;
   for (const object of objects) {
-    parts.push(writePackObjectHeader(object.type, object.data.length));
-    parts.push(deflateObject(object.oid, object.type, object.data));
+    const header = packObjectHeaderBytes(object.type, object.data.length);
+    const deflated = deflateObject(object.oid, object.type, object.data);
+    entries.push({ header, deflated });
+    bodyLength += header.length + deflated.length;
   }
-  const body = Buffer.concat(parts);
-  return Buffer.concat([body, createHash('sha1').update(body).digest()]);
+  const out = Buffer.allocUnsafe(bodyLength + 20);
+  out.write('PACK', 0, 4, 'ascii');
+  out.writeUInt32BE(2, 4);
+  out.writeUInt32BE(objects.length, 8);
+  let offset = 12;
+  for (const entry of entries) {
+    for (const byte of entry.header) out[offset++] = byte;
+    out.set(entry.deflated, offset);
+    offset += entry.deflated.length;
+  }
+  const trailer = createHash('sha1').update(out.subarray(0, bodyLength)).digest();
+  out.set(trailer, bodyLength);
+  return out;
 }
 
 function readVarintSize(buffer: Buffer, start: number): { size: number; next: number; first: number } | null {
